@@ -1,0 +1,250 @@
+#!/bin/sh
+
+# Function to print usage instructions
+print_usage() {
+	echo "Usage: $0 -a ami-id -s security-group-id -k keypair-id -t instance-type [-r region] [-d instance-name] [-v ebs-volume-size]"
+	exit 1
+}
+
+# Prints an error message to standard error and exits with a non-zero exit
+# code.
+e_die() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\n\033[1;31;40mxxx \033[1;37;40m%s\033[0m\n\n" "$1" >&2
+			;;
+		*)
+			printf -- "\nxxx %s\n\n" "$1" >&2
+			;;
+	esac
+
+	exit 1
+}
+
+# Determines whether or not a program is available on the system PATH.
+check_cmd() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		return 1
+	fi
+}
+
+# Prints an informational, detailed step to standard out.
+info() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;36;40m  - \033[1;37;40m%s\033[0m\n" "$1"
+			;;
+		*)
+			printf -- "  - %s\n" "$1"
+			;;
+	esac
+}
+
+# Function to check for specific files in the monitored directory
+check_files() {
+	ssh -o StrictHostKeyChecking=no "ec2-user@$PUBLIC_DNS" "ls -1 $MONITOR_DIR" 2>/dev/null
+}
+
+# Parse input arguments
+while getopts 'a:s:k:t:r:d:u:v:' flag; do
+	case "${flag}" in
+		a) AMI_ID="${OPTARG}" ;;
+		s) SECURITY_GROUP_ID="${OPTARG}" ;;
+		k) KEYPAIR_ID="${OPTARG}" ;;
+		t) INSTANCE_TYPE="${OPTARG}" ;;
+		r) REGION="${OPTARG}" ;;
+		d) INSTANCE_NAME="${OPTARG}" ;;
+		v) EBS_VOLUME_SIZE="${OPTARG}" ;;
+		*) print_usage ;;
+	esac
+done
+
+# Check if AWS CLI is installed
+if check_cmd aws; then
+	_AWS_BIN=$(command -v aws)
+else
+	e_die "Error: AWS CLI is not installed or not in PATH."
+fi
+
+# Check AWS environment variables or configuration files
+if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+	# If environment variables are not set, check configuration files
+	if [ ! -f "$HOME/.aws/credentials" ] && [ ! -f "$HOME/.aws/config" ]; then
+		e_die "Error: AWS CLI credentials are not configured via environment variables or configuration files."
+	fi
+
+	# If no AWS_PROFILE is set, check for a default profile
+	if [ -z "$AWS_PROFILE" ]; then
+		if ! grep -q "\[default\]" "$HOME/.aws/credentials" 2>/dev/null; then
+			e_die "Error: No default profile found in ~/.aws/credentials."
+		fi
+	fi
+else
+	# Check if the specified profile exists
+	if ! aws configure list-profiles | grep -q "^$AWS_PROFILE$"; then
+		e_die "Error: AWS profile '$AWS_PROFILE' does not exist."
+	fi
+fi
+
+# Validate AWS CLI configuration by making a simple API call
+if ! "$_AWS_BIN" sts get-caller-identity >/dev/null 2>&1; then
+	e_die "Error: AWS CLI is not properly configured or credentials are invalid."
+fi
+
+# Set some additional variables
+MONITOR_DIR="/root"         # Directory on the EC2 instance to monitor
+LOCAL_DESTINATION="$HOME"    # Local directory where files will be copied
+CHECK_INTERVAL=60           # Time in seconds between checks
+CONFIGURED_REGION=$(aws configure get region)
+
+# Check if the region is set in the AWS CLI configuration
+if [ -n "$AWS_DEFAULT_REGION" ]; then
+	DEFAULT_REGION="$AWS_DEFAULT_REGION"
+elif [ -n "$AWS_REGION" ]; then
+	DEFAULT_REGION="$AWS_REGION"
+elif [ -n "$CONFIGURED_REGION" ]; then
+	DEFAULT_REGION="$CONFIGURED_REGION"
+fi
+
+# Set default values if not provided
+: "${REGION:=${DEFAULT_REGION}}"
+: "${INSTANCE_TYPE:=t2.micro}"
+: "${INSTANCE_NAME:=FreeBSD-Instance}"
+: "${KEYPAIR_ID:=Default}"
+: "${SECURITY_GROUP_ID:=sg-0f06fc6660ee7fc09}"
+: "${AMI_ID:=ami-0fa07f8dc310e352c}"
+: "${EBS_VOLUME_SIZE:=44}"  # Default EBS volume size is 8 GB
+: "${RUN_SCRIPT:=${PWD}/run_script}"
+
+# Check if mandatory arguments are provided
+if [ -z "$AMI_ID" ] || [ -z "$SECURITY_GROUP_ID" ] || [ -z "$KEYPAIR_ID" ] || [ -z "$REGION" ]; then
+	echo "Error: AMI ID, Security Group ID, Region and Keypair ID are mandatory."
+	print_usage
+fi
+
+_VALID_IMAGE=$("$_AWS_BIN" ec2 describe-images --image-ids "$AMI_ID" --query 'Images[*].[Description]' --output text 2>/dev/null)
+
+if [ -z "$_VALID_IMAGE" ]; then
+	e_die "Error: The Image ID $_IMAGE_ID is invalid or does not exist in the specified region."
+else
+	# Extract the machine architecture, git branch, and git hash from the description
+	_MACHINE_PLATFORM=$(echo "$_VALID_IMAGE" | awk -F' ' '{print $1}' | awk -F'/' '{print $2}')
+	_GIT_BRANCH=$(echo "$_VALID_IMAGE" | awk -F' ' '{print $2}' | awk -F'@' '{print $1}')
+	_GIT_HASH=$(echo "$_VALID_IMAGE" | awk -F'@' '{print $2}')
+	if [ "$_MACHINE_PLATFORM" = "amd64" ]; then
+		_MACHINE_ARCH="amd64"
+	elif [ "$_MACHINE_PLATFORM" = "arm64" ]; then
+		_MACHINE_ARCH="aarch64"
+	fi
+	info "Machine Platform: ${_MACHINE_PLATFORM}"
+	info "Machine Architecture: ${_MACHINE_ARCH}"
+	info "Git branch: ${_GIT_BRANCH}"
+	info "Git hash: ${_GIT_HASH}"
+	if [ -z "$_GIT_BRANCH" ] || [ -z "$_GIT_HASH" ]; then
+		print_git_warning
+	fi
+fi
+
+echo "#!/bin/sh" > "$RUN_SCRIPT"
+echo 'sysrc sshd_flags="-o ClientAliveInterval=300 -o StreamLocalBindUnlink=yes"' >> "$RUN_SCRIPT"
+echo 'sysrc sshd_oomprotect="YES"' >> "$RUN_SCRIPT"
+echo 'service sshd restart' >> "$RUN_SCRIPT"
+echo 'sysrc firstboot_freebsd_update_enable="NO"' >> "$RUN_SCRIPT"
+echo 'pkg install -y git-lite htop screen sysutils/py-diffoscope' >> "$RUN_SCRIPT"
+echo "echo '#!/bin/sh' > /root/runit" >> "$RUN_SCRIPT"
+echo "echo _PARALLELISM=\$(sysctl -n hw.ncpu) >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo _MACHINE_ARCH=$_MACHINE_ARCH >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo _MACHINE_PLATFORM=$_MACHINE_PLATFORM>> /root/runit" >> "$RUN_SCRIPT"
+echo "echo _GIT_BRANCH=\"$_GIT_BRANCH\" >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo _GIT_HASH=$_GIT_HASH >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo _DISTDIR=\$(find /usr/obj -type d -name cw-ec2-ufs-raw) >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'echo PROCESS STARTED @ \$(date +"%Y%m%d-%H%M%S") >> /root/PROCESS_RESULT' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo '/usr/local/bin/git clone --branch \$_GIT_BRANCH https://git.freebsd.org/src.git /usr/src 2>&1' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'cd /usr/src && git checkout \$_GIT_HASH' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'if ! make -C /usr/src -DNO_CLEAN WITH_REPRODUCIBLE_BUILD=yes buildworld -j \$_PARALLELISM > /dev/null 2>&1; then echo BUILDWORLD FAIL @ \$(date +%Y%m%d-%H%M%S) >> /root/PROCESS_RESULT; touch /root/PROCESS_FAIL; exit 1; fi' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'if ! make -C /usr/src -DNO_CLEAN WITH_REPRODUCIBLE_BUILD=yes buildkernel -j \$_PARALLELISM > /dev/null 2>&1; then echo BUILDKERNEL FAIL @ \$(date +%Y%m%d-%H%M%S) >> /root/PROCESS_RESULT; touch /root/PROCESS_FAIL; exit 1; fi' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'if ! make -C /usr/src/release cloudware-release WITH_CLOUDWARE=yes CLOUDWARE=EC2 NOPKG=yes NOPORTS=yes NOSRC=yes EC2_FSLIST=ufs; then echo VM-RELEASE FAIL @ \$(date +%Y%m%d-%H%M%S) >> /root/PROCESS_RESULT; touch /root/PROCESS_FAIL; exit 1; fi' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'echo PROCESS FINISHED @ \$(date +"%Y%m%d-%H%M%S") >> /root/PROCESS_RESULT' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'mkdir -p /mnt/build' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'mkdir -p /mnt/root' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'mount -t nullfs / /mnt/root' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'mount -t nullfs \$_DISTDIR /mnt/build' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo '/usr/local/bin/diffoscope --html /root/freebsd.html /mnt/build /mnt/root' >> /root/runit" >> "$RUN_SCRIPT"
+echo "echo 'touch /root/PROCESS_FINISHED' >> /root/runit" >> "$RUN_SCRIPT"
+echo "chmod +x /root/runit" >> "$RUN_SCRIPT"
+echo "/root/runit > /root/output.log 2>&1" >> "$RUN_SCRIPT"
+
+INSTANCE_NAME="FreeBSD-$INSTANCE_TYPE"
+echo "Deploying instance $INSTANCE_NAME"
+
+# Deploy the instance and capture the instance ID
+INSTANCE_ID=$(aws ec2 run-instances \
+	--image-id "$AMI_ID" \
+	--security-group-ids "$SECURITY_GROUP_ID" \
+	--key-name "$KEYPAIR_ID" \
+	--instance-type "$INSTANCE_TYPE" \
+	--region "$REGION" \
+	--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME}]" \
+	--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$EBS_VOLUME_SIZE}" \
+	--user-data file://"$PWD"/run_script \
+	--query 'Instances[0].InstanceId' \
+	--output text)
+
+if [ -z "$INSTANCE_ID" ]; then
+	e_die "Failed to deploy the instance."
+fi
+
+# Wait until the instance is in 'running' state
+echo "Waiting for the instance $INSTANCE_ID to enter the 'running' state..."
+"$_AWS_BIN" ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+
+# Retrieve the public IP address or public DNS of the instance
+PUBLIC_DNS=$(aws ec2 describe-instances \
+	--instance-ids "$INSTANCE_ID" \
+	--region "$REGION" \
+	--query 'Reservations[0].Instances[0].PublicDnsName' \
+	--output text)
+
+if [ -n "$PUBLIC_DNS" ]; then
+	echo "Instance Public DNS: $PUBLIC_DNS"
+fi
+
+# Get the public DNS of the instance
+PUBLIC_DNS=$(aws ec2 describe-instances \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --query "Reservations[0].Instances[0].PublicDnsName" \
+  --output text)
+
+# Continuous monitoring loop
+while true; do
+	FILES=$(check_files)
+
+	if echo "$FILES" | grep -q "PROCESS_FINISHED"; then
+		echo "PROCESS_FINISHED found. Copying /root/freebsd.html to $LOCAL_DESTINATION..."
+
+		# Copy the required file locally
+		scp -o StrictHostKeyChecking=no "ec2-user@$PUBLIC_DNS:/root/freebsd.html" "$LOCAL_DESTINATION/freebsd-$AMI_ID.html"
+
+		# Exit the loop
+		break
+	elif echo "$FILES" | grep -q "PROCESS_FAILED"; then
+		echo "PROCESS_FAILED found. Copying /root/PROCESS_RESULT to $LOCAL_DESTINATION..."
+
+		# Copy the required file locally
+		scp -o StrictHostKeyChecking=no "ec2-user@$PUBLIC_DNS:/root/output.log" "$LOCAL_DESTINATION/output-$AMI_ID.log"
+
+		# Exit the loop
+		break
+	else
+		echo "No matching files found. Checking again in $CHECK_INTERVAL seconds..."
+	fi
+
+	# Wait for the specified interval before checking again
+	sleep "$CHECK_INTERVAL"
+done
+
+# Terminate the EC2 instance
+echo "Terminating the EC2 instance..."
+"${_AWS_BIN}" ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID"
+echo "Terminated the EC2 instance...$INSTANCE_ID"
